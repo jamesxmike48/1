@@ -7,9 +7,9 @@ on:
       ts_api_key:         { description: "Tailscale API key (device admin, no Bearer)", required: true }
       ts_authkey:         { description: "Tailscale Auth key (reusable or ephemeral)", required: true }
       quick_test:         { description: "Run 5-minute test", type: boolean, default: false }
-      runtime_minutes:    { description: "Runtime (max 360; default 355 when not test)", required: false, default: "355" }
+      runtime_minutes:    { description: "Runtime (max 360; default 360 for extended runs)", required: false, default: "360" }  # Updated to max 360 minutes
       do_purge:           { description: "Purge bullet* devices at start (single instance only)", required: false, default: "true" }
-      cycles:             { description: "0=stop after this run; N=handoffs left incl this run", required: false, default: "0" }
+      cycles:             { description: "0=stop after this run; N=handoffs left incl this run (set to 28 for ~1 week)", required: false, default: "28" }  # Updated default to 28 for ~7 days
       rdp_count:          { description: "How many RDP instances (1-10) [ignored if CRD provided]", required: false, default: "1" }
       crd_code:
         description: >-
@@ -56,7 +56,7 @@ jobs:
 
   rdp:
     needs: setup
-    runs-on: [self-hosted, windows, gpu-rtx3090]  # Changed to self-hosted runner with RTX 3090 GPU
+    runs-on: windows-latest  # GitHub-hosted runner (no GPU)
     strategy:
       matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
       max-parallel: 10
@@ -165,10 +165,10 @@ jobs:
 
           function Yes($v){ "$v" -match '^(?i:true|1|yes|on)$' }
           function IntOr($v,$d){ if("$v" -match '^\d+$'){ [int]$v } else { [int]$d } }
-          $runtime = IntOr("${{ inputs.runtime_minutes }}",355)
+          $runtime = IntOr("${{ inputs.runtime_minutes }}",360)  # Updated to default 360
           if (Yes("${{ inputs.quick_test }}")) { $runtime = 5 }
-          if (-not (Yes("${{ inputs.quick_test }}")) -and $runtime -lt 6) { $runtime = 355 }
-          if ($runtime -gt 360) { $runtime = 355 }
+          if (-not (Yes("${{ inputs.quick_test }}")) -and $runtime -lt 6) { $runtime = 360 }  # Updated to 360
+          if ($runtime -gt 360) { $runtime = 360 }
           "RUNTIME_MINUTES=$runtime" | Out-File -Append $env:GITHUB_ENV
           Write-Host "Hostname: $hn  | Runtime: $runtime"
 
@@ -225,24 +225,6 @@ jobs:
           Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
           Write-Host "RDP ready. user=$u pass=$p host=$env:TS_HOSTNAME ip=$env:TAILSCALE_IP"
-
-      - name: Install NVIDIA Drivers for RTX 3090
-        run: |
-          # Check if NVIDIA GPU is present
-          $gpu = Get-WmiObject -Class Win32_VideoController | Where-Object { $_.Name -like "*NVIDIA*" -and $_.Name -like "*RTX 3090*" }
-          if (-not $gpu) {
-            Write-Warning "RTX 3090 GPU not detected. Proceeding anyway."
-          } else {
-            Write-Host "RTX 3090 GPU detected: $($gpu.Name)"
-          }
-
-          # Download and install latest NVIDIA drivers (assumes RTX 3090 compatibility)
-          $driverUrl = "https://us.download.nvidia.com/Windows/560.94/560.94-desktop-win10-win11-64bit-international-dch-whql.exe"  # Example URL; update to latest if needed
-          $installerPath = "$env:TEMP\nvidia-driver.exe"
-          Invoke-WebRequest -Uri $driverUrl -OutFile $installerPath
-          Start-Process -FilePath $installerPath -ArgumentList "/s" -Wait  # Silent install
-          Remove-Item $installerPath -Force
-          Write-Host "NVIDIA drivers installed for RTX 3090."
 
       - name: Install Python libs (pyautogui/pynput/pillow)
         run: |
@@ -305,4 +287,19 @@ jobs:
           $end = (Get-Date).AddMinutes($mins)
           while ((Get-Date) -lt $end) {
             $mode = if ("$env:CRD_ENABLED" -eq '1') { '[CRD+RustDesk/RDP]' } else { '[RustDesk/RDP]' }
-            Write-Host ("$mode Heartbeat " + (Get-Date).ToString("HH:mm:ss") + " ends at " + $end.ToString("HH:mm:ss") + " | RS URL: $env:SCREEN
+            Write-Host ("$mode Heartbeat " + (Get-Date).ToString("HH:mm:ss") + " ends at " + $end.ToString("HH:mm:ss") + " | RS URL: $env:SCREENSHOT_URL")
+            Start-Sleep -Seconds 60
+          }
+
+      - name: Dispatch next or stop
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $cycles = [int]"${{ inputs.cycles }}"
+          if ($cycles -gt 0) {
+            $next = $cycles - 1
+            if ($next -le 0) {
+              $url = "https://api.github.com/repos/${{ github.repository }}/actions/workflows/rdp-tailscale-stop.yml/dispatches"
+              $hdr = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json" }
+              $payload = @{ ts_tailnet="${{ inputs.ts_tailnet }}"; ts
